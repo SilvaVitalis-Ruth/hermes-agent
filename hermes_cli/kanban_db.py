@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import difflib
 import hashlib
 import json
 import os
@@ -158,6 +159,11 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
 
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
+_FORCED_SKILL_SUGGESTION_LIMIT = 3
+_FORCED_SKILL_SUGGESTION_CUTOFF = 0.6
+_STARTUP_STDERR_READ_BYTES = 8192
+_STARTUP_STDERR_MAX_BYTES = 384
+_STARTUP_STDERR_MAX_LINES = 4
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
@@ -3166,6 +3172,139 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+@contextlib.contextmanager
+def _target_profile_skill_scope(
+    assignee: str,
+    *,
+    profile_home: Optional[str] = None,
+):
+    """Scope the canonical skill resolver to one profile without mutating env."""
+    from hermes_cli.profiles import resolve_profile_env
+
+    try:
+        home = Path(profile_home or resolve_profile_env(assignee))
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValueError(
+            f"cannot validate forced skills for assignee {assignee!r}: profile not found"
+        ) from exc
+
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from tools.terminal_scope import terminal_scope
+
+    token = set_hermes_home_override(str(home))
+    try:
+        # A task may eventually run in a repository that has trusted project
+        # skills. Pre-insert validation intentionally answers the narrower
+        # director-owned question: what can the target PROFILE resolve? Using
+        # the profile home as the resolver cwd prevents the creator's current
+        # repository from leaking project-local skills into that answer.
+        with terminal_scope({"TERMINAL_CWD": str(home)}):
+            yield
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _resolver_visible_skill_names(
+    assignee: str,
+    *,
+    profile_home: Optional[str] = None,
+) -> set[str]:
+    """List only the named profile's resolver-visible skill names."""
+    from tools.skills_tool import skills_list
+
+    with _target_profile_skill_scope(assignee, profile_home=profile_home):
+        try:
+            payload = json.loads(skills_list())
+        except (TypeError, ValueError):
+            return set()
+    if not payload.get("success"):
+        return set()
+    return {
+        str(skill["name"])
+        for skill in payload.get("skills", ())
+        if isinstance(skill, Mapping) and skill.get("name")
+    }
+
+
+def _validate_forced_skills(
+    assignee: Optional[str],
+    skills: Optional[Iterable[str]],
+    *,
+    profile_home: Optional[str] = None,
+) -> None:
+    """Fail atomically when forced skills cannot resolve for the assignee."""
+    requested = [str(skill) for skill in (skills or ()) if skill]
+    if not requested:
+        return
+    if not assignee:
+        invalid_names = "; ".join(map(repr, requested))
+        raise ValueError(
+            f"invalid skill(s) for assignee None: {invalid_names} "
+            "(forced skills require a target profile)"
+        )
+
+    # Use the exact preload resolver the worker will use, including
+    # frontmatter-name lookup, categorized paths, external directories,
+    # qualified plugin skills, collision refusal, and disabled-skill policy.
+    from agent.skill_commands import _load_skill_payload
+    from agent.skill_utils import get_disabled_skill_names
+
+    invalid: list[str] = []
+    try:
+        with _target_profile_skill_scope(assignee, profile_home=profile_home):
+            disabled = get_disabled_skill_names()
+            for name in requested:
+                loaded = _load_skill_payload(name)
+                if not loaded:
+                    invalid.append(name)
+                    continue
+                _payload, _skill_dir, resolved_name = loaded
+                if name in disabled or resolved_name in disabled:
+                    invalid.append(name)
+    except ValueError as exc:
+        invalid_names = "; ".join(map(repr, requested))
+        raise ValueError(
+            f"invalid skill(s) for assignee {assignee!r}: {invalid_names} "
+            "(target profile unavailable)"
+        ) from exc
+    if not invalid:
+        return
+
+    try:
+        available = _resolver_visible_skill_names(
+            assignee, profile_home=profile_home
+        )
+    except ValueError:
+        # The profile can disappear between validation and suggestion lookup.
+        # The invalid-name diagnosis remains complete without suggestions.
+        available = set()
+    details: list[str] = []
+    candidates = sorted(available)
+    suggestion_budget = _FORCED_SKILL_SUGGESTION_LIMIT
+    for name in invalid:
+        close = (
+            difflib.get_close_matches(
+                name,
+                candidates,
+                n=suggestion_budget,
+                cutoff=_FORCED_SKILL_SUGGESTION_CUTOFF,
+            )
+            if suggestion_budget
+            else []
+        )
+        suggestion_budget -= len(close)
+        detail = repr(name)
+        if close:
+            detail += " (close matches: " + ", ".join(map(repr, close)) + ")"
+        details.append(detail)
+    raise ValueError(
+        f"invalid skill(s) for assignee {assignee!r}: " + "; ".join(details)
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3216,7 +3355,9 @@ def create_task(
     the worker when dispatched. Stored as JSON; the dispatcher passes
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
-    translation skill regardless of the profile's default config).
+    translation skill regardless of the profile's default config). New tasks
+    are rejected before insertion when any name is not force-loadable by the
+    target assignee profile; dispatch revalidates to catch later profile drift.
 
     ``model_override`` / ``provider_override`` pin the worker to a specific
     model (and optionally its provider) without touching the profile's
@@ -3418,6 +3559,11 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+
+    # Preserve the existing idempotent retry contract: a duplicate request
+    # returns the already-persisted card even if its profile has drifted since
+    # the original insert. New cards still validate before the write begins.
+    _validate_forced_skills(assignee, skills_list)
 
     now = int(time.time())
 
@@ -8108,6 +8254,46 @@ _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
 
+def _startup_stderr_excerpt(task_id: str) -> str:
+    """Return a force-redacted, line- and byte-bounded tail of a worker log."""
+    path = worker_log_path(task_id)
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(0, size - _STARTUP_STDERR_READ_BYTES)
+            handle.seek(start, os.SEEK_SET)
+            raw = handle.read(_STARTUP_STDERR_READ_BYTES)
+    except OSError:
+        return ""
+
+    # A bounded tail can begin inside a credential assignment. Dropping that
+    # partial first line before redaction prevents an otherwise unrecognizable
+    # secret suffix from reaching durable task/run metadata.
+    if start:
+        _partial, separator, raw = raw.partition(b"\n")
+        if not separator:
+            return ""
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()[-_STARTUP_STDERR_MAX_LINES:]
+    try:
+        from agent.redact import redact_sensitive_text
+
+        redacted = redact_sensitive_text(
+            "\n".join(lines), force=True, code_file=True
+        )
+    except Exception:
+        # Persist no source bytes when the common redactor is unavailable.
+        return "[startup stderr withheld: redaction unavailable]"
+    encoded = redacted.encode("utf-8")
+    if len(encoded) > _STARTUP_STDERR_MAX_BYTES:
+        encoded = encoded[-_STARTUP_STDERR_MAX_BYTES:]
+        redacted = encoded.decode("utf-8", errors="ignore")
+        if "\n" in redacted:
+            redacted = redacted.split("\n", 1)[1]
+    return redacted.strip()
+
+
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
 
@@ -8978,6 +9164,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 protocol_violation = False
                 if kind == "nonzero_exit":
                     error_text = f"pid {pid} exited with code {code}"
+                    excerpt = _startup_stderr_excerpt(row["id"])
+                    if excerpt:
+                        error_text += f"; startup stderr: {excerpt}"
                 elif kind == "signaled":
                     error_text = f"pid {pid} killed by signal {code}"
                 else:
@@ -10769,6 +10958,20 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
+    # Validate against the target profile before constructing a subprocess
+    # environment. A stale skill must fail closed without inspecting or copying
+    # unrelated ambient credential/config state into a child-env mapping.
+    from hermes_cli.profiles import resolve_profile_env
+
+    profile_home = None
+    try:
+        profile_home = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        # Preserve the historical missing-profile error path for unskilled
+        # test fixtures. Forced skills still fail atomically below.
+        pass
+    _validate_forced_skills(profile_arg, task.skills, profile_home=profile_home)
+
     prompt = f"work kanban task {task.id}"
     from agent.secret_scope import is_multiplex_active
     from tools.environments.local import build_subprocess_env
@@ -10793,15 +10996,8 @@ def _default_spawn(
     # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
-    from hermes_cli.profiles import resolve_profile_env
-    try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
-    except FileNotFoundError:
-        # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
-        # This only happens in test fixtures where the isolated
-        # HERMES_HOME never had profiles created.
-        pass
+    if profile_home is not None:
+        env["HERMES_HOME"] = profile_home
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
