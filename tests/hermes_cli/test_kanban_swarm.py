@@ -9,6 +9,19 @@ from hermes_cli.kanban_swarm import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _forced_skill_profiles(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Give swarm-assigned profiles the bundled skills the graph forces."""
+    hermes_home = tmp_path / ".hermes"
+    for profile, skill in (
+        ("reviewer", "requesting-code-review"),
+        ("writer", "humanizer"),
+    ):
+        skill_dir = hermes_home / "profiles" / profile / "skills" / skill
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(f"# {skill}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
 def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):
     conn = kb.connect(tmp_path / "kanban.db")
     try:

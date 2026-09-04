@@ -482,6 +482,14 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     import hermes_cli.profiles as profmod
 
     monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    skill_dir = (
+        kanban_home / "profiles" / "reviewer" / "skills" / "domain-specific-review"
+    )
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: domain-specific-review\ndescription: test reviewer\n---\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         cfgmod,
         "load_config",
